@@ -1,0 +1,304 @@
+---
+title: "Project"
+author: "Jennifer Wong"
+output:
+  html_document:
+    highlight: tango
+    number_sections: no
+    theme: cosmo
+    toc: yes
+  pdf_document:
+    toc: yes
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load in the data and library
+```{r}
+library(dplyr)
+library(data.table)
+library(magrittr)
+library(ggmap)
+library(lubridate)
+library(tidyverse)
+train <- as.data.frame(fread("train.csv"))
+weather <- as.data.frame(fread("weather.csv"))
+test <- as.data.frame(fread("test.csv"))
+spray <- as.data.frame(fread("spray.csv"))
+```
+
+## 3.fit logistic regression to model. 
+
+## Cleaning Weather data
+```{r}
+na_weather <- apply(weather, 2, function(x) any(is.na(x) | is.infinite(x)))
+na_weather
+
+weather$Tmean <- (weather$Tmax + weather$Tmin)/2 #creating new Tmean variable to replaced Tavg that has missing values. since Tavg is simply calculated as the average of Tmax and Tmin
+weather$Tmean <- ceiling(weather$Tmean) #rounding Tmean
+
+weather$PrecipTotal <- as.numeric(weather$PrecipTotal) #changing to numeric - auto make T into NA
+colSums(is.na(weather)) #320 NA
+
+weather <- weather %>% 
+  mutate(TotPrecip = if_else(is.na(PrecipTotal), 0, weather$PrecipTotal)) #changing NA to 0
+
+n_weather <- weather %>% 
+           #select(Date:TotPrecip) %>% #selecting all columns
+          filter(Station == 1) %>%
+          mutate_each(funs(as.numeric), -Date) %>%  #setting all default character variables as numeric, except date 
+           mutate(Date = as.Date(Date)) #putting date in date format 
+           
+
+colSums(is.na(n_weather)) #there are 163 NA in the PrecipTotal column
+#n_weather[is.na(n_weather)] = 0 #converting NA (previously trace in weather dataset = indicating trace amnount/inches of precip) to 0
+#colSums(is.na(n_weather)) #now there are 0 NA in the PrecipTotal column 
+
+#n_weather$Tmean <- ceiling(n_weather$Tmean) 0 if want to round temp up
+
+head(n_weather) 
+```
+## Spray EDA
+```{r}
+head(spray)
+
+spray$Time <- strptime(spray$Time, "%H:%M:%S")
+spray$Time <- format(spray$Time, "%H:%M:%S")
+
+# create time features
+spray$day  <- as.factor(wday(spray$Date))
+spray$week <- as.factor(week(spray$Date))
+spray$year <- as.factor(year(spray$Date))
+summary(spray)
+
+# check for uniqueness in the co-ordinates provided
+select(spray, Latitude, Longitude) %>% 
+  group_by(Latitude, Longitude) %>% 
+  tally %>%  
+  filter(n > 1)
+#Latitude 41.98646 duplicated many times and need to be deleted if using spray data. Time is irrelevant and should be dropped
+
+
+categories <- unique(spray$Date)
+categories
+#did not do any spraying in 2012. Spraying can reduce the number of mosquitos in the area, and therefore might eliminate the appearance of West Nile virus. 
+```
+## Visualize Spray
+```{r}
+spray_ordered = spray %>%
+    mutate(day_ordered = fct_infreq(day))
+#day <- factor(c("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"))
+
+p_spray = ggplot(spray_ordered, aes(x = day_ordered)) +
+  geom_bar()
+
+p_spray
+
+#Every week from Monday through Wednesday, traps collect mosquitos, and the mosquitos are tested for the presence of West Nile virus before the end of the week. 
+```
+#Train EDA
+```{r}
+#grouping lower species group into other
+train$Species_group <- train$Species
+
+train$WnvPresent <- as.factor(train$WnvPresent)
+train$Species <- as.factor(train$Species)
+train$Trap <- as.factor(train$Trap)
+train$Species_group <- as.factor(train$Species_group)
+
+#inspect the distribution of species
+train %>% 
+  group_by(Species) %>% 
+  summarise(NumMosquitos =sum(NumMosquitos)) %>% 
+  arrange(desc(NumMosquitos))
+
+
+#check to make sure coded correctly
+train %>% group_by(Species, Species_group) %>% 
+  summarise(NumMosquitos = sum(NumMosquitos)) %>% 
+  arrange(desc(NumMosquitos))
+  
+```
+
+
+## Test EDA
+```{r}
+test$Species_group <- with(test, if_else(Species %in% c('CULEX PIPIENS/RESTUANS',
+                                                        'CULEX PIPIENS',
+                                                        'CULEX RESTUANS',
+                                                        'CULEX TERRITANS',
+                                                        'CULEX SALINARIUS',
+                                                        'CULEX ERRATICUS',
+                                                        'CULEX TARSALIS'),
+                                         Species, 'CULEX PIPIENS/RESTUANS'))
+
+
+test$Species <- as.factor(test$Species)
+test$Trap <- as.factor(test$Trap)
+test$Species_group <- as.factor(test$Species_group)
+
+
+# check Species
+test %>% group_by(Species) %>% tally %>% arrange(desc(n))
+train %>% group_by(Species) %>% tally %>% arrange(desc(n))
+
+#it does not contain NumMosquitos (population information), so we should avoid using this as a predictor (unless we can forecast this at any given time)
+#there are other species that are not in the training set -> need to group in same manner as training data 
+
+
+# quick check
+test %>% group_by(Species, Species_group) %>% tally %>% arrange(desc(n))
+
+```
+
+## combining test + weather
+```{r}
+n_test <- test %>%
+         mutate(Date = as.Date(Date)) %>%   #putting date in date format 
+         left_join(n_weather, by="Date")  #joining dataframe by date column
+
+colnames(n_test)
+colnames(test)
+```
+## combining weather + train data
+```{r}
+n_train <- train %>%
+         mutate(Date = as.Date(Date)) %>%   #putting date in date format 
+         left_join(n_weather, by="Date")  #joining dataframe by date column
+
+colnames(n_train)
+colnames(train)
+```
+
+## Counts Distribution and Map On One Day
+```{r}
+library(ggmap)
+library(readr)
+data_dir <- "../input"
+mapdata <- readRDS(file.path(data_dir, "mapdata_copyright_openstreetmap_contributors.rds"))
+
+#Station 1: CHICAGO O'HARE INTERNATIONAL AIRPORT Lat: 41.995 Lon: -87.933 Elev: 662 ft. above sea level
+#Station 2: CHICAGO MIDWAY INTL ARPT Lat: 41.786 Lon: -87.752 Elev: 612 ft. above sea level
+stations <- data.frame(c(1,2), c(41.995,41.786), c(-87.933,-87.752))
+names(stations) <- c("Station","Latitude","Longitude")
+
+#Which date has the most measurements?
+counts_by_date <- n_train %>%  
+  dplyr::group_by(Date) %>% 
+  dplyr::summarise(NumMeasurements = n()) %>%
+  dplyr::arrange(desc(NumMeasurements))
+
+head(counts_by_date) #2007-08-01 had the most measurements in one day
+
+date_to_show <- counts_by_date$Date[1]
+
+single_date_grouped_by_location <- n_train %>% 
+  dplyr::filter(Date == "2007-08-01") %>%
+  dplyr::group_by(Longitude, Latitude) %>%
+  dplyr::summarize(NumMosquitos = sum(NumMosquitos))
+
+qplot(single_date_grouped_by_location$NumMosquitos) + 
+  scale_x_log10() + 
+  xlab("Number of Mosquitos") +
+  ylab("Number of test sites w/ this many mosquitos") +
+  ggtitle("Distribution of Mosquito Counts (Log Scale)")
+
+
+ggmap(mapdata) + 
+  geom_point(aes(x = Longitude, y = Latitude, color = NumMosquitos), size = 3, data = 
+               single_date_grouped_by_location) +
+  scale_color_continuous(trans = "log") +
+  ggtitle(sprintf("Spatial Arrangement of Mosquito Counts on %s", date_to_show))
+
+#looking at geographic distribution of wnv
+ggmap(mapdata) + 
+  geom_point(aes(x = Longitude, y = Latitude, color = WnvPresent), size = 3, data = 
+               n_train) 
+  ggtitle(sprintf("Spatial Arrangement of Mosquito Counts on %s", date_to_show))
+
+```
+## Random Forest
+
+```{r}
+library(randomForest)
+library(MASS)
+set.seed(1)
+```
+
+```{r}
+n_train$day<-as.numeric(day(as.Date(n_train$Date)))        # Day of the month: (1:30)
+n_train$dayofyear<-as.numeric(yday(as.Date(n_train$Date))) # Day number of year: (1:356)
+n_train$dayofweek<-as.factor(wday(as.Date(n_train$Date)))  # Values: (2:6)
+n_train$week <- as.integer(week(as.Date(n_train$Date)))    # Week of the year
+
+
+
+n_test$day<-as.numeric(day(as.Date(n_test$Date)))          # Day of the month: (1:30)
+n_test$dayofyear<-as.numeric(yday(as.Date(n_test$Date)))   # Day number of year: (1:356)
+n_test$dayofweek<-as.factor(wday(as.Date(n_test$Date)))    # Values: (2:6)
+n_test$week <- as.integer(week(as.Date(n_test$Date)))      # Week of year 
+
+```
+
+```{r}
+x=c(1:3,5:7,11,20,25,27:30)
+n_train2 = n_train[-x]
+
+```
+
+
+```{r}
+library(randomForest)
+library(MASS)
+set.seed(1)
+
+rf <- randomForest(WnvPresent ~ ., data = n_train2, mtry = 5, importance = TRUE) #for random forest reduce m to 6 (sqrt of 13)
+yhat.rf <- predict(rf, newdata = n_test, cutoff = c(.93,.07))
+
+summary(yhat.rf)
+
+```
+```{r}
+output <- data.frame(Id = n_test$Id, WnvPresent =yhat.rf)
+
+write.csv(output,'output.csv', row.names = FALSE)
+```
+
+
+
+## question: does avg wind speed influence how many mosquitos get trapped.
+
+```{r}
+
+Q2<-n_train %>% group_by(Date) %>% summarise(sum = sum(NumMosquitos),average = mean(NumMosquitos), Dir = median(ResultDir),ResultSpeed = median(ResultSpeed),windavgspeed = median(AvgSpeed))
+
+d2c.2 <- function(x) {
+  upper <- seq(from = 11.25, by = 22.5, length.out = 17)
+  card1 <- c('N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW', 'N')
+  ifelse(x>360 | x<0,NA,card1[findInterval(x,upper,rightmost.closed = T)+1])
+}
+
+
+Q2$Direction= d2c.2(Q2$Dir)
+
+```
+
+
+```{r}
+cor(Q2[-c(1,7)],method = 'pearson')
+
+
+```
+
+
+```{r}
+
+Q2 %>% group_by(Direction) %>% summarise(mean = mean(average))
+
+one.way <- aov(average ~ Direction , data = Q2)
+
+summary(one.way)
+
+```
+
